@@ -1,0 +1,48 @@
+# Every 6 hours: iptv-org's grabber for the channels in channels.tsv, turned into epg.tsv.gz for TV Home.
+# The file goes to the `guide` branch as a single commit (force-pushed), so the repository never grows.
+# Pluto and Plex publish only about 14 hours ahead, hence four runs a day rather than one.
+name: Guide
+on:
+  schedule:
+    - cron: '15 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: guide
+  cancel-in-progress: false
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Guide sources for the channels
+        run: |
+          curl -fsSL --retry 3 -o guides.json https://iptv-org.github.io/api/guides.json
+          python3 make_channels.py guides.json channels.tsv custom.channels.xml
+      - name: iptv-org's grabber, only the sites in use
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/iptv-org/epg.git grabber
+          grep -o 'site="[^"]*"' custom.channels.xml | cut -d'"' -f2 | sort -u | sed 's#^#/sites/#; s#$#/#' \
+            | xargs git -C grabber sparse-checkout set --no-cone '/*' '!/sites/*'
+          cd grabber && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Grab
+        working-directory: grabber
+        run: npm run grab --- --channels=../custom.channels.xml --output=../guide.xml --days=2 --maxConnections=8 --timeout=30000
+      - name: Convert
+        run: python3 convert.py guide.xml epg.tsv.gz
+      - name: Publish to the guide branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir out && cp epg.tsv.gz out/ && cd out
+          git init -q -b guide
+          git add epg.tsv.gz
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "Guide $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" guide
+          curl -fsS "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@guide/epg.tsv.gz" > /dev/null || true
